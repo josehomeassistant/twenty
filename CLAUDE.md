@@ -48,3 +48,13 @@ npx nx run twenty-front:graphql:generate      # after GraphQL schema changes (--
 - **Entity file changes need a generated instance command**: `npx nx run twenty-server:database:migrate:generate --name <name> --type <fast|slow>` (slow = adds a data-backfill step).
 - A read-only Postgres MCP server is configured in `.mcp.json` for inspecting workspace data, metadata, and migration results. Writes go through the CLI commands above.
 - E2E login: click "Continue with Email" and use the prefilled credentials.
+
+## Base44 sandbox
+
+- See `.base44/README.md` for the sandbox runbook. Do not run `setup-dev-env.sh` here: Compose already supplies environment values and initializes the database without copying example credentials.
+- `AGENTS.md` is a symlink to this file; preserve it.
+- The sandbox starts with an empty database, not the dev seed: no prefilled login exists. The expected anonymous screen is `/welcome`; sign in/create a workspace in the preview for signed-in verification.
+- Frontend requests use the browser origin; `REACT_APP_SERVER_BASE_URL=http://api:3000` controls Vite's existing proxy only. Keep the API private and publish only the frontend on host port 3000.
+- The API's Nest watcher compiles all server source to `dist`; the worker uses Node watch on that output to avoid two compilers racing over the same directory.
+- First startup installs the entire locked workspace and builds library dependencies (including the front-component sandbox); allow roughly ten minutes. Rebuild changed shared libraries before relying on them in the running app.
+- Health verification: `docker compose -f docker-compose.base44.yml ps -a`, `curl -f http://localhost:3000/`, and `curl -f http://localhost:3000/client-config`. The setup job should exit 0; all five long-running services should be healthy. Browser verification must wait for `Continue with Email` after the initial source compilation.
