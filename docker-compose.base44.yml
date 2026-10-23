@@ -1,0 +1,133 @@
+x-app: &app
+  image: node:24-bookworm
+  working_dir: /app
+  volumes:
+    - .:/app
+    - node_modules:/app/node_modules
+    - yarn_cache:/root/.yarn
+  env_file:
+    - /run/base44/app.env
+  environment: &environment
+    BASE44_PREVIEW_MODE:
+    NODE_ENV: development
+    NODE_OPTIONS: --max-old-space-size=4096
+    NX_DAEMON: "false"
+    NX_ISOLATE_PLUGINS: "false"
+    NX_SKIP_NX_CACHE: "true"
+    PG_DATABASE_URL: postgres://twenty:base44_local_db@db:5432/default
+    REDIS_URL: redis://redis:6379
+    FRONTEND_URL: https://3000-${BASE44_PUBLIC_HOST_SUFFIX}
+    SERVER_URL: https://3000-${BASE44_PUBLIC_HOST_SUFFIX}
+    PORT: "3000"
+    STORAGE_TYPE: local
+    EMAIL_DRIVER: LOGGER
+    EMAILING_DOMAIN_DRIVER: LOG
+    IS_WORKSPACE_CREATION_LIMITED_TO_SERVER_ADMINS: "false"
+    CHOKIDAR_USEPOLLING: "true"
+    CHOKIDAR_INTERVAL: "1000"
+
+services:
+  db:
+    image: postgres:16
+    restart: on-failure
+    environment:
+      POSTGRES_USER: twenty
+      POSTGRES_PASSWORD: base44_local_db
+      POSTGRES_DB: default
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U twenty -d default"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  redis:
+    image: redis:7
+    restart: on-failure
+    command: [redis-server, --appendonly, "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  setup:
+    <<: *app
+    # Yarn's install workers are threads that each inherit NODE_OPTIONS, so the
+    # shared 4 GB heap let the fetch step balloon past the sandbox VM's memory
+    # and get the container OOM-killed. Cap the install heap and worker count,
+    # then raise it back for the single-process build and migration steps.
+    environment:
+      <<: *environment
+      NODE_OPTIONS: --max-old-space-size=1536
+      YARN_TASK_POOL_CONCURRENCY: "2"
+    command:
+      - sh
+      - -ec
+      - |
+        corepack enable
+        yarn install --immutable
+        export NODE_OPTIONS=--max-old-space-size=3584
+        yarn nx run-many -t build -p twenty-server twenty-ui twenty-front-component-renderer --parallel=1
+        cd packages/twenty-server
+        node dist/database/scripts/setup-db.js
+        node dist/command/command.js run-instance-commands --force --include-slow
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+  api:
+    <<: *app
+    restart: on-failure
+    command: [sh, -ec, "cd packages/twenty-server && exec ../../node_modules/.bin/nest start --watch"]
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://localhost:3000/healthz',{signal:AbortSignal.timeout(4000)}).then(r=>{if(!r.ok)throw Error('API unhealthy')}).catch(e=>{console.error(e);process.exit(1)})"]
+      interval: 20s
+      timeout: 5s
+      start_period: 120s
+      retries: 5
+  worker:
+    <<: *app
+    restart: on-failure
+    command: [sh, -ec, "cd packages/twenty-server && exec node --watch dist/queue-worker/queue-worker.js"]
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, node, -e, "const Redis=require('ioredis');const r=new Redis(process.env.REDIS_URL);r.client('LIST').then(s=>{if(!s.includes('cmd=bzpopmin'))throw Error('No active queue worker');return r.quit()}).catch(e=>{console.error(e);process.exit(1)})"]
+      interval: 30s
+      timeout: 5s
+      start_period: 90s
+      retries: 5
+  web:
+    <<: *app
+    restart: on-failure
+    environment:
+      <<: *environment
+      __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS:
+      VITE_HOST: 0.0.0.0
+      REACT_APP_PORT: "3001"
+      REACT_APP_SERVER_BASE_URL: http://api:3000
+    command: [sh, -ec, "cd packages/twenty-front && exec ../../node_modules/.bin/vite --host 0.0.0.0"]
+    ports:
+      - "3000:3001"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, node, -e, "Promise.all(['/','/client-config'].map(async p=>{const r=await fetch('http://localhost:3001'+p,{signal:AbortSignal.timeout(4000)});if(!r.ok)throw Error('Web check failed: '+p)})).catch(e=>{console.error(e);process.exit(1)})"]
+      interval: 20s
+      timeout: 5s
+      start_period: 180s
+      retries: 5
+
+volumes:
+  node_modules:
+  yarn_cache:
+  postgres_data:
+  redis_data:
